@@ -2,7 +2,7 @@
 
 **Edge público** que consume el frontend OnixGuard. Escrito en **Go**. Expone **REST + WebSocket + auth JWT**. Lee de PostgreSQL y se suscribe a NATS para empujar el vivo. Sin lógica de negocio pesada.
 
-> **Estado:** se construye en **Fase 1–3**. En Fase 1 empuja la lista de actividad en vivo por WS; en Fase 3 reenvía las acciones del jefe a `onix-orchestrator`. Este README documenta su diseño.
+> **Estado (Fase 1 ✅):** se suscribe a `onix.raw.*` en NATS y empuja cada evento por **WebSocket** (`/ws`) como `{type:"event", data:<evento>}`; expone `GET /api/events` (carga inicial desde Postgres) y `/healthz`. Verificado E2E (2026-09-30): push en vivo <1s. Auth JWT, más REST y el reenvío al orchestrator llegan en Fases 2–3.
 
 ---
 
