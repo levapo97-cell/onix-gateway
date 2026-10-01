@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -105,7 +106,12 @@ func main() {
 		writeJSON(w, 200, map[string]any{"status": "ok", "service": "onix-gateway", "version": version, "ws_clients": h.Count()})
 	})
 	// ─── Auth (login del panel) ───
+	loginLimiter := newRateLimiter(5, time.Minute) // 5 intentos/min por IP
 	mux.HandleFunc("POST /auth/login", func(w http.ResponseWriter, r *http.Request) {
+		if !loginLimiter.allow(clientIP(r)) {
+			writeJSON(w, 429, map[string]any{"error": "demasiados intentos, espera un momento"})
+			return
+		}
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
@@ -155,6 +161,19 @@ func main() {
 			return
 		}
 		writeJSON(w, 200, d)
+	})
+	mux.HandleFunc("GET /api/postmortem", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 200, map[string]any{"conclusion": "sin datos"})
+			return
+		}
+		pm, err := st.PostMortem(r.Context())
+		if err != nil {
+			slog.Error("/api/postmortem", "err", err)
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, pm)
 	})
 	mux.HandleFunc("POST /api/export", func(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
@@ -454,6 +473,51 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// rateLimiter: límite simple en memoria (N eventos por ventana, por clave/IP). Para /auth/login.
+type rateLimiter struct {
+	mu     sync.Mutex
+	hits   map[string][]time.Time
+	max    int
+	window time.Duration
+}
+
+func newRateLimiter(max int, window time.Duration) *rateLimiter {
+	return &rateLimiter{hits: make(map[string][]time.Time), max: max, window: window}
+}
+
+func (l *rateLimiter) allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := now.Add(-l.window)
+	kept := l.hits[key][:0]
+	for _, t := range l.hits[key] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= l.max {
+		l.hits[key] = kept
+		return false
+	}
+	l.hits[key] = append(kept, now)
+	return true
+}
+
+func clientIP(r *http.Request) string {
+	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		if i := strings.IndexByte(xf, ','); i >= 0 {
+			return strings.TrimSpace(xf[:i])
+		}
+		return strings.TrimSpace(xf)
+	}
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return host
 }
 
 func runHealthcheck(port string) int {
