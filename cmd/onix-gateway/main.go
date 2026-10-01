@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -125,13 +126,54 @@ func main() {
 			writeJSON(w, 200, []any{})
 			return
 		}
-		rows, err := st.RecentEvents(r.Context(), 50)
+		q := r.URL.Query()
+		f := store.EventFilters{AgentRole: q.Get("agent"), Type: q.Get("type"), Q: q.Get("q")}
+		if s := q.Get("stage"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil {
+				f.Stage = &n
+			}
+		}
+		if l := q.Get("limit"); l != "" {
+			f.Limit, _ = strconv.Atoi(l)
+		}
+		rows, err := st.EventsFiltered(r.Context(), f)
 		if err != nil {
 			slog.Error("/api/events falló", "err", err)
 			writeJSON(w, 500, map[string]any{"error": "db"})
 			return
 		}
 		writeJSON(w, 200, rows)
+	})
+	mux.HandleFunc("GET /api/events/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 404, map[string]any{"error": "no db"})
+			return
+		}
+		d, err := st.EventDetail(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, 404, map[string]any{"error": "no existe"})
+			return
+		}
+		writeJSON(w, 200, d)
+	})
+	mux.HandleFunc("POST /api/export", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 503, map[string]any{"error": "no db"})
+			return
+		}
+		var b struct {
+			Scope  string `json:"scope"`
+			Format string `json:"format"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		content, ctype, filename, err := st.ExportEvents(r.Context(), b.Scope, b.Format)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": "export falló"})
+			return
+		}
+		w.Header().Set("Content-Type", ctype)
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+		_, _ = w.Write([]byte(content))
 	})
 	// ─── Reportes (Fase 3) ───
 	mux.HandleFunc("GET /api/reports", func(w http.ResponseWriter, r *http.Request) {
