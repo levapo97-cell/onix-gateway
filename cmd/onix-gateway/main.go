@@ -1,15 +1,17 @@
 // Command onix-gateway — edge público que consume el frontend OnixGuard.
 //
-// FASE 1: se suscribe a onix.raw.* en NATS y empuja cada evento por WebSocket (/ws) como
-// {type:"event", data:<evento>}. Expone GET /api/events (carga inicial desde Postgres) y /healthz.
-// (Auth JWT, más endpoints REST y el reenvío al orchestrator llegan en Fases posteriores.)
+// Se suscribe a onix.clean.* (eventos) y onix.report.* (reportes) en NATS y los empuja por
+// WebSocket (/ws). Expone GET /api/events, y (Fase 3) GET /api/reports, GET /api/reports/{id}
+// y POST /api/reports/{id}/respond (reenvía al orchestrator). /healthz. (Auth JWT: fase posterior.)
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -39,6 +41,7 @@ func main() {
 	port := env("PORT", "8080")
 	natsURL := env("NATS_URL", "nats://nats:4222")
 	databaseURL := os.Getenv("DATABASE_URL")
+	orchestratorURL := env("ORCHESTRATOR_URL", "http://orchestrator:8085")
 	slog.Info("onix-gateway arrancando", "version", version, "port", port, "nats_url", natsURL, "has_db", databaseURL != "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -78,6 +81,16 @@ func main() {
 	}
 	defer sub.Drain()
 
+	// FASE 3: el orchestrator avisa de reportes nuevos → empuja {type:"report"} al panel.
+	subR, err := nc.Subscribe("onix.report.>", func(m *nats.Msg) {
+		var data json.RawMessage = m.Data
+		msg, _ := json.Marshal(map[string]any{"type": "report", "data": data})
+		h.Broadcast(msg)
+	})
+	if err == nil {
+		defer subR.Drain()
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": "ok", "service": "onix-gateway", "version": version, "ws_clients": h.Count()})
@@ -94,6 +107,54 @@ func main() {
 			return
 		}
 		writeJSON(w, 200, rows)
+	})
+	// ─── Reportes (Fase 3) ───
+	mux.HandleFunc("GET /api/reports", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 200, []any{})
+			return
+		}
+		rows, err := st.Reports(r.Context(), 100)
+		if err != nil {
+			slog.Error("/api/reports falló", "err", err)
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, rows)
+	})
+	mux.HandleFunc("GET /api/reports/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 404, map[string]any{"error": "no db"})
+			return
+		}
+		rep, err := st.Report(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, 404, map[string]any{"error": "no existe"})
+			return
+		}
+		writeJSON(w, 200, rep)
+	})
+	mux.HandleFunc("POST /api/reports/{id}/respond", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Action  string `json:"action"`
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Action == "" {
+			writeJSON(w, 400, map[string]any{"error": "action es obligatorio"})
+			return
+		}
+		// Reenvía al orchestrator, que resuelve la llamada MCP pendiente del agente.
+		payload, _ := json.Marshal(map[string]string{"report_id": r.PathValue("id"), "action": body.Action, "message": body.Message})
+		resp, err := http.Post(orchestratorURL+"/respond", "application/json", bytes.NewReader(payload))
+		if err != nil {
+			slog.Error("no se pudo contactar al orchestrator", "err", err)
+			writeJSON(w, 502, map[string]any{"error": "orchestrator no disponible"})
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
 	})
 	mux.HandleFunc("/ws", wsHandler(h))
 
