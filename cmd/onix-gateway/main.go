@@ -74,6 +74,8 @@ func main() {
 		var data json.RawMessage = m.Data
 		msg, _ := json.Marshal(map[string]any{"type": "event", "data": data})
 		h.Broadcast(msg)
+		// Señal de refresco de métricas (el panel vuelve a pedir /api/overview y /api/agents).
+		h.Broadcast([]byte(`{"type":"metrics"}`))
 	})
 	if err != nil {
 		slog.Error("no se pudo suscribir a NATS", "err", err)
@@ -86,6 +88,9 @@ func main() {
 		var data json.RawMessage = m.Data
 		msg, _ := json.Marshal(map[string]any{"type": "report", "data": data})
 		h.Broadcast(msg)
+		// Un reporte (o su aprobación) puede cambiar la etapa y las métricas → refresca.
+		h.Broadcast([]byte(`{"type":"stage"}`))
+		h.Broadcast([]byte(`{"type":"metrics"}`))
 	})
 	if err == nil {
 		defer subR.Drain()
@@ -155,6 +160,44 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
+	})
+	// ─── Métricas de Monitoreo (Fase 4) ───
+	mux.HandleFunc("GET /api/overview", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 200, store.Overview{TotalStages: 12, CurrentStage: 1})
+			return
+		}
+		o, err := st.Overview(r.Context())
+		if err != nil {
+			slog.Error("/api/overview", "err", err)
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, o)
+	})
+	mux.HandleFunc("GET /api/stages", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 200, []any{})
+			return
+		}
+		rows, err := st.StageList(r.Context())
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, rows)
+	})
+	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 200, []any{})
+			return
+		}
+		rows, err := st.AgentList(r.Context())
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, rows)
 	})
 	mux.HandleFunc("/ws", wsHandler(h))
 
