@@ -26,18 +26,24 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	if err != nil {
 		return o, err
 	}
-	o.TotalStages = 12
-	// etapa actual = la 'activa'; si no hay, (hechas)+1, acotado a 1..12.
+	// Plan dinámico: etapas del ticket vigente (el más reciente).
+	ticketID, ok := s.latestTicketID(ctx)
+	if !ok {
+		o.TotalStages = 0
+		o.CurrentStage = 0
+		return o, nil
+	}
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stages WHERE ticket_id=$1`, ticketID).Scan(&o.TotalStages)
 	var current *int
-	_ = s.pool.QueryRow(ctx, `SELECT number FROM stages WHERE status='activa' ORDER BY number LIMIT 1`).Scan(&current)
+	_ = s.pool.QueryRow(ctx, `SELECT number FROM stages WHERE ticket_id=$1 AND status='activa' ORDER BY number LIMIT 1`, ticketID).Scan(&current)
 	if current != nil {
 		o.CurrentStage = *current
 	} else {
 		var done int
-		_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stages WHERE status='hecha'`).Scan(&done)
-		o.CurrentStage = done + 1
-		if o.CurrentStage > 12 {
-			o.CurrentStage = 12
+		_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM stages WHERE ticket_id=$1 AND status='hecha'`, ticketID).Scan(&done)
+		o.CurrentStage = done
+		if o.TotalStages > 0 && o.CurrentStage < o.TotalStages {
+			o.CurrentStage++ // la siguiente por trabajar
 		}
 	}
 	return o, nil
@@ -51,7 +57,11 @@ type StageRow struct {
 }
 
 func (s *Store) StageList(ctx context.Context) ([]StageRow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT number, name, status FROM stages ORDER BY number`)
+	ticketID, ok := s.latestTicketID(ctx)
+	if !ok {
+		return []StageRow{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT number, name, status FROM stages WHERE ticket_id=$1 ORDER BY number`, ticketID)
 	if err != nil {
 		return nil, err
 	}

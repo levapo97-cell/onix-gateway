@@ -161,6 +161,54 @@ func main() {
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	})
+	// ─── Tickets (Fase 5) ───
+	mux.HandleFunc("GET /api/tickets", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 200, []any{})
+			return
+		}
+		rows, err := st.Tickets(r.Context())
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, rows)
+	})
+	mux.HandleFunc("POST /api/tickets", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 503, map[string]any{"error": "no db"})
+			return
+		}
+		var body struct {
+			Title  string `json:"title"`
+			Body   string `json:"body"`
+			Source string `json:"source"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Title == "" {
+			writeJSON(w, 400, map[string]any{"error": "title es obligatorio"})
+			return
+		}
+		id, err := st.CreateTicket(r.Context(), body.Title, body.Body, body.Source)
+		if err != nil {
+			slog.Error("crear ticket", "err", err)
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 201, map[string]any{"id": id})
+	})
+	mux.HandleFunc("GET /api/tickets/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 404, map[string]any{"error": "no db"})
+			return
+		}
+		t, err := st.TicketDetail(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeJSON(w, 404, map[string]any{"error": "no existe"})
+			return
+		}
+		writeJSON(w, 200, t)
+	})
+
 	// ─── Métricas de Monitoreo (Fase 4) ───
 	mux.HandleFunc("GET /api/overview", func(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
