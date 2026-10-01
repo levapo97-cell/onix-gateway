@@ -65,7 +65,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer nc.Close()
-	sub, err := nc.Subscribe("onix.raw.>", func(m *nats.Msg) {
+	// FASE 2: el gateway empuja el evento LIMPIO (redactado y enriquecido), no el raw.
+	sub, err := nc.Subscribe("onix.clean.>", func(m *nats.Msg) {
 		// Reempaqueta el evento como WsMessage {type:"event", data:<evento>}.
 		var data json.RawMessage = m.Data
 		msg, _ := json.Marshal(map[string]any{"type": "event", "data": data})
