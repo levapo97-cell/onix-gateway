@@ -16,12 +16,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
 
+	"github.com/levapo97-cell/onix-gateway/internal/auth"
 	"github.com/levapo97-cell/onix-gateway/internal/hub"
 	"github.com/levapo97-cell/onix-gateway/internal/store"
 )
@@ -42,6 +44,7 @@ func main() {
 	natsURL := env("NATS_URL", "nats://nats:4222")
 	databaseURL := os.Getenv("DATABASE_URL")
 	orchestratorURL := env("ORCHESTRATOR_URL", "http://orchestrator:8085")
+	authz := auth.New(os.Getenv("PANEL_USER"), os.Getenv("PANEL_PASSWORD"), os.Getenv("PANEL_PASSWORD_HASH"), os.Getenv("JWT_SECRET"))
 	slog.Info("onix-gateway arrancando", "version", version, "port", port, "nats_url", natsURL, "has_db", databaseURL != "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -99,6 +102,23 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": "ok", "service": "onix-gateway", "version": version, "ws_clients": h.Count()})
+	})
+	// ─── Auth (login del panel) ───
+	mux.HandleFunc("POST /auth/login", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, 400, map[string]any{"error": "body inválido"})
+			return
+		}
+		tok, err := authz.Login(body.Username, body.Password)
+		if err != nil {
+			writeJSON(w, 401, map[string]any{"error": "credenciales inválidas"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"token": tok, "user": body.Username})
 	})
 	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
@@ -209,6 +229,35 @@ func main() {
 		writeJSON(w, 200, t)
 	})
 
+	// ─── Proyectos / repos (Fase 6) — reenvía al onix-agent de la PC por NATS request-reply ───
+	agentReq := func(w http.ResponseWriter, payload map[string]string, timeout time.Duration) {
+		data, _ := json.Marshal(payload)
+		msg, err := nc.Request("onix.agent.cmd", data, timeout)
+		if err != nil {
+			writeJSON(w, 502, map[string]any{"error": "onix-agent no disponible (¿está corriendo en tu PC?)"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write(msg.Data)
+	}
+	mux.HandleFunc("GET /api/projects", func(w http.ResponseWriter, _ *http.Request) {
+		agentReq(w, map[string]string{"action": "project.list"}, 8*time.Second)
+	})
+	mux.HandleFunc("POST /api/projects/check", func(w http.ResponseWriter, r *http.Request) {
+		var b struct{ Name string `json:"name"` }
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		agentReq(w, map[string]string{"action": "repo.check", "name": b.Name}, 8*time.Second)
+	})
+	mux.HandleFunc("POST /api/projects/clone", func(w http.ResponseWriter, r *http.Request) {
+		var b struct{ URL string `json:"url"` }
+		if err := json.NewDecoder(r.Body).Decode(&b); err != nil || b.URL == "" {
+			writeJSON(w, 400, map[string]any{"error": "url es obligatorio"})
+			return
+		}
+		agentReq(w, map[string]string{"action": "repo.clone", "url": b.URL}, 5*time.Minute)
+	})
+
 	// ─── Métricas de Monitoreo (Fase 4) ───
 	mux.HandleFunc("GET /api/overview", func(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
@@ -247,9 +296,9 @@ func main() {
 		}
 		writeJSON(w, 200, rows)
 	})
-	mux.HandleFunc("/ws", wsHandler(h))
+	mux.HandleFunc("/ws", wsHandler(h, authz))
 
-	srv := &http.Server{Addr: ":" + port, Handler: withCORS(mux), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: ":" + port, Handler: withCORS(authGate(authz, mux)), ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -273,8 +322,13 @@ func main() {
 // upgrader de WebSocket. En dev aceptamos cualquier origin; en prod se restringe.
 var upgrader = websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 
-func wsHandler(h *hub.Hub) http.HandlerFunc {
+func wsHandler(h *hub.Hub, a *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Auth del WS por query param (?token=<jwt>), ya que el navegador no manda headers en WS.
+		if !a.ValidToken(r.URL.Query().Get("token")) {
+			http.Error(w, "no autorizado", http.StatusUnauthorized)
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -315,6 +369,23 @@ func wsHandler(h *hub.Hub) http.HandlerFunc {
 			}
 		}
 	}
+}
+
+// authGate exige JWT en las rutas /api/*. El resto (/, /healthz, /auth/login, /ws) pasa:
+// /ws valida el token por query param dentro de wsHandler.
+func authGate(a *auth.Auth, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodOptions && strings.HasPrefix(r.URL.Path, "/api/") {
+			tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if !a.ValidToken(tok) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"no autorizado"}`))
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func withCORS(next http.Handler) http.Handler {
