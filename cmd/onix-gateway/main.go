@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -277,6 +278,58 @@ func main() {
 		}
 		writeJSON(w, 201, map[string]any{"id": id})
 	})
+	mux.HandleFunc("POST /api/tickets/{id}/attachment", func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, 503, map[string]any{"error": "no db"})
+			return
+		}
+		id := r.PathValue("id")
+		if !st.TicketExists(r.Context(), id) {
+			writeJSON(w, 404, map[string]any{"error": "ticket no existe"})
+			return
+		}
+		if err := r.ParseMultipartForm(8 << 20); err != nil { // máx 8 MB
+			writeJSON(w, 400, map[string]any{"error": "archivo inválido o muy grande"})
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, 400, map[string]any{"error": "falta el campo 'file'"})
+			return
+		}
+		defer file.Close()
+
+		uploadDir := env("UPLOAD_DIR", "/data/uploads")
+		_ = os.MkdirAll(uploadDir, 0o755)
+		safeName := filepath.Base(header.Filename)
+		dest := filepath.Join(uploadDir, id+"__"+safeName)
+		out, err := os.Create(dest)
+		if err != nil {
+			slog.Error("guardar adjunto", "err", err)
+			writeJSON(w, 500, map[string]any{"error": "no se pudo guardar"})
+			return
+		}
+		if _, err := io.Copy(out, file); err != nil {
+			out.Close()
+			writeJSON(w, 500, map[string]any{"error": "no se pudo guardar"})
+			return
+		}
+		out.Close()
+
+		// Si es texto (plan/ticket), lee su contenido y añádelo al body para que el agente lo use.
+		var text string
+		if isTextFile(safeName) {
+			if b, err := os.ReadFile(dest); err == nil && len(b) <= 262144 { // máx 256 KB de texto
+				text = string(b)
+			}
+		}
+		if err := st.SetAttachment(r.Context(), id, safeName, dest, text); err != nil {
+			slog.Error("registrar adjunto", "err", err)
+			writeJSON(w, 500, map[string]any{"error": "db"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "filename": safeName, "ingested_text": text != ""})
+	})
 	mux.HandleFunc("GET /api/tickets/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
 			writeJSON(w, 404, map[string]any{"error": "no db"})
@@ -504,6 +557,14 @@ func (l *rateLimiter) allow(key string) bool {
 	}
 	l.hits[key] = append(kept, now)
 	return true
+}
+
+func isTextFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log", ".sql":
+		return true
+	}
+	return false
 }
 
 func clientIP(r *http.Request) string {
