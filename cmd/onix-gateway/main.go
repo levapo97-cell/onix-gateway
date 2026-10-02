@@ -372,6 +372,35 @@ func main() {
 		agentReq(w, map[string]string{"action": "repo.clone", "url": b.URL}, 5*time.Minute)
 	})
 
+	// ─── Sesiones de agentes en la PC (cerrar/pausar/reanudar) — vía onix-agent ───
+	agentReqAny := func(w http.ResponseWriter, payload map[string]any, timeout time.Duration) {
+		data, _ := json.Marshal(payload)
+		msg, err := nc.Request("onix.agent.cmd", data, timeout)
+		if err != nil {
+			writeJSON(w, 502, map[string]any{"error": "onix-agent no disponible (¿está corriendo en tu PC?)"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write(msg.Data)
+	}
+	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		agentReqAny(w, map[string]any{"action": "session.list"}, 8*time.Second)
+	})
+	sessionAction := func(action string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var b struct{ Pid int `json:"pid"` }
+			if err := json.NewDecoder(r.Body).Decode(&b); err != nil || b.Pid <= 1 {
+				writeJSON(w, 400, map[string]any{"error": "pid inválido"})
+				return
+			}
+			agentReqAny(w, map[string]any{"action": action, "pid": b.Pid}, 8*time.Second)
+		}
+	}
+	mux.HandleFunc("POST /api/sessions/close", sessionAction("session.close"))
+	mux.HandleFunc("POST /api/sessions/pause", sessionAction("session.pause"))
+	mux.HandleFunc("POST /api/sessions/resume", sessionAction("session.resume"))
+
 	// ─── Métricas de Monitoreo (Fase 4) ───
 	mux.HandleFunc("GET /api/overview", func(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
